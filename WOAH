@@ -1,0 +1,970 @@
+import os
+import sys
+import cv2
+import threading
+import numpy as np
+import time
+from datetime import datetime
+import concurrent.futures
+import logging
+import queue
+import json
+import traceback
+import glob
+import easyocr
+from queue import Queue
+from typing import Optional, Tuple, Any
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+
+# ============================================================================
+# SETTINGS
+# ============================================================================
+MOTION_THRESHOLD_PERCENT = 15
+SENSITIVITY_CHANGE_THRESHOLD = 10  # Absolute percentage change required to trigger scene change
+MATCH_COOLDOWN_SECONDS = 5
+MATCH_THRESHOLD = 95
+MOTION_BLUR_KERNEL_SIZE = 151
+TOTAL_SCAN_TIME = 12
+EACH_ANGLE_TIMEOUT = 3
+DEFAULT_RTSP_URL = "rtsp://root:123456789@192.168.0.90/axis-media/media.amp?streamprofile=STREAM2"
+MATCHED_IMAGE_DIR = "matched_images"
+CAMERA_RECONNECT_ATTEMPTS = 10
+CAMERA_RECONNECT_DELAY = 0.5
+CAMERA_FPS = 20  # Default fallback FPS
+CAMERA_FPS_RATIO = 0.8  # Process at 80% of detected camera FPS
+OCR_MAX_WORKERS = 4
+
+# Global variable for motion threshold - can be updated from config
+MOTION_THRESHOLD = 12  # Threshold for motion detection (0-255)
+
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+class AppState:
+    def __init__(self):
+        self.materials = ['pepsi', 'coke', 'sprite', 'fanta']
+        self.rtsp_url = DEFAULT_RTSP_URL
+        self.roi_box: Optional[Tuple[int, int, int, int]] = None
+        self.raw_roi_img: Optional[Any] = None
+        self.latest_frame: Optional[Any] = None
+        self.background_gray: Optional[Any] = None
+        self.scanning_active = False
+        self.last_match_time: Optional[Any] = None
+        self.last_match_sensitivity: Optional[float] = None
+        self.scene_changed_flag = False
+        self.ocr_requests_running = False
+        self.background_accumulator = None  # For accumulating background frames
+        self.skip_frames = 0  # For skipping frames during stabilization
+        self.current_sensitivity = 0.0  # Current motion sensitivity from monitor thread
+        self.last_sensitivity_readings = []  # For smoothing sensitivity readings
+        self.frame_timestamps = []  # For measuring actual camera FPS
+
+state = AppState()
+# Removed default ROI initialization
+lock = threading.Lock()
+shutdown_event = threading.Event()
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+def exe_dir_path(filename):
+    if getattr(sys, 'frozen', False):
+        folder = os.path.dirname(sys.executable)
+    else:
+        folder = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(folder, filename)
+
+def load_config():
+    """Load configuration from materials.txt"""
+    global MOTION_THRESHOLD  # Make it accessible for modification
+    config_file = exe_dir_path("materials.txt")
+   
+    # Default configuration values
+    defaults = {
+        "ROI": "",
+        "RTSP_URL": "rtsp://root:123456789@192.168.0.90/axis-media/media.amp",
+        "MATERIALS": ["pepsi", "coke", "sprite", "fanta"],
+        "MOTION_THRESHOLD": 12
+    }
+   
+    # Create default config if file doesn't exist
+    if not os.path.exists(config_file):
+        default_config = [
+            f"ROI:{defaults['ROI']}",
+            f"RTSP_URL:{defaults['RTSP_URL']}",
+            f"MOTION_THRESHOLD:{defaults['MOTION_THRESHOLD']}  # 0=super sensitive, 255=blind",
+            *defaults['MATERIALS']
+        ]
+        try:
+            with open(config_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(default_config))
+            print(f"[INFO] Created default materials.txt")
+        except Exception as e:
+            print(f"[ERROR] Failed to create default config: {e}")
+   
+    # Initialize state with defaults
+    state.rtsp_url = defaults["RTSP_URL"]
+    state.materials = []  # Start with empty materials list
+    MOTION_THRESHOLD = defaults["MOTION_THRESHOLD"]  # Initialize with default
+   
+    try:
+        if os.path.exists(config_file):
+            with open(config_file, 'r', encoding='utf-8') as f:
+                lines = [line.strip() for line in f if line.strip()]
+           
+            for line in lines:
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key, value = key.strip(), value.strip()
+                    
+                    # Remove comments from value
+                    if '#' in value:
+                        value = value.split('#')[0].strip()
+                    
+                    if key == 'ROI' and value:
+                        try:
+                            coords = list(map(int, value.split(',')))
+                            if len(coords) == 4:
+                                state.roi_box = (coords[0], coords[1], coords[2], coords[3])
+                        except ValueError:
+                            pass
+                    elif key == 'RTSP_URL' and value:
+                        state.rtsp_url = value
+                    elif key == 'MOTION_THRESHOLD' and value:
+                        try:
+                            MOTION_THRESHOLD = int(value)
+                            if MOTION_THRESHOLD < 0:
+                                MOTION_THRESHOLD = 0
+                            elif MOTION_THRESHOLD > 255:
+                                MOTION_THRESHOLD = 255
+                        except ValueError:
+                            print(f"[WARN] Invalid MOTION_THRESHOLD value: {value}, using default")
+                else:
+                    if line and not any(line.startswith(k) for k in ['ROI:', 'RTSP_URL:', 'MOTION_THRESHOLD:']):
+                        if line not in state.materials:
+                            state.materials.append(line)
+       
+        print(f"[INFO] Loaded config: ROI={state.roi_box}, Materials={len(state.materials)}")
+        print(f"[INFO] RTSP URL: {state.rtsp_url}")
+        print(f"[INFO] Materials: {state.materials}")
+        print(f"[INFO] Motion Threshold: {MOTION_THRESHOLD} (0=super sensitive, 255=blind)")
+    except Exception as e:
+        print(f"[ERROR] Failed to load config: {e}")
+
+def measure_camera_fps_from_timestamps():
+    """Measure actual camera FPS from frame capture timestamps over 5 seconds"""
+    # Wait and collect timestamps for 5 seconds
+    start_time = time.time()
+    
+    # Wait for 5 seconds of capture data
+    while time.time() - start_time < 5.0:
+        time.sleep(0.1)
+    
+    # Get timestamps from the last 5 seconds with thread safety
+    with lock:
+        current_time = time.time()
+        recent_timestamps = [t for t in state.frame_timestamps if current_time - t <= 5.0]
+    
+    if len(recent_timestamps) < 10:
+        print(f"[WARN] Insufficient frame data to measure FPS ({len(recent_timestamps)} frames in 5s)")
+        return None
+    
+    # Calculate FPS from number of frames in time period
+    time_span = max(recent_timestamps) - min(recent_timestamps)
+    if time_span < 4.0:  # Need reasonable time span
+        print(f"[WARN] Time span too small for accurate measurement ({time_span:.1f}s)")
+        return None
+    
+    frame_count = len(recent_timestamps)
+    detected_fps = frame_count / time_span
+    
+    return detected_fps
+
+def detect_camera_fps(cap):
+    """Detect actual camera FPS by measuring frame intervals (initial setup only)"""
+    print("[INFO] Detecting initial camera FPS...")
+    frame_times = []
+    start_time = time.time()
+    
+    # Measure frame intervals for 3 seconds during initial setup
+    while len(frame_times) < 50 and time.time() - start_time < 3:
+        ret, _ = cap.read()
+        if ret:
+            frame_times.append(time.time())
+        time.sleep(0.01)
+    
+    if len(frame_times) < 10:
+        print(f"[WARN] Could not detect FPS, using default {CAMERA_FPS}")
+        return CAMERA_FPS
+    
+    # Calculate average FPS from intervals
+    intervals = [frame_times[i] - frame_times[i-1] for i in range(1, len(frame_times))]
+    avg_interval = sum(intervals) / len(intervals)
+    detected_fps = 1.0 / avg_interval
+    
+    print(f"[INFO] Initial camera FPS: {detected_fps:.1f}")
+    return detected_fps
+
+def connect_camera():
+    """Connect to camera with retry logic and FPS detection"""
+    for attempt in range(1, CAMERA_RECONNECT_ATTEMPTS + 1):
+        try:
+            cap = cv2.VideoCapture(state.rtsp_url or DEFAULT_RTSP_URL)
+            # Don't set FPS - let camera use its natural rate
+           
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    print(f"[INFO] Camera connected on attempt {attempt}")
+                    
+                    # Detect actual camera FPS
+                    actual_fps = detect_camera_fps(cap)
+                    processing_fps = actual_fps * CAMERA_FPS_RATIO
+                    
+                    print(f"[INFO] Initial camera FPS: {actual_fps:.1f}, Processing at: {processing_fps:.1f} ({CAMERA_FPS_RATIO*100:.0f}%)")
+                    print(f"[INFO] FPS will be re-measured every 10 seconds to adapt to changes")
+                    
+                    # Store the processing FPS globally
+                    global CAMERA_FPS
+                    CAMERA_FPS = processing_fps
+                    
+                    return cap
+            cap.release()
+        except Exception as e:
+            print(f"[ERROR] Camera connection failed: {e}")
+       
+        if attempt < CAMERA_RECONNECT_ATTEMPTS:
+            time.sleep(CAMERA_RECONNECT_DELAY)
+   
+    raise RuntimeError("Failed to connect to camera")
+
+def initialize_easyocr():
+    """Initialize EasyOCR reader when needed"""
+    print("[INFO] Initializing EasyOCR...")
+    reader = easyocr.Reader(['en'], gpu=False)  # Use GPU if available
+    print("[INFO] EasyOCR initialized")
+    return reader
+
+def cleanup_easyocr():
+    """Cleanup EasyOCR reader to free resources"""
+    # EasyOCR cleanup is handled by Python garbage collection
+    print("[INFO] EasyOCR cleaned up")
+
+def calculate_sensitivity(background_gray, current_gray):
+    """Calculate motion sensitivity percentage with pattern/vibration resistance and stability"""
+    if background_gray is None or current_gray is None:
+        return 0.0
+   
+    # 1. Apply strong Gaussian blur to reduce high-frequency patterns
+    kernel = (MOTION_BLUR_KERNEL_SIZE, MOTION_BLUR_KERNEL_SIZE)
+    blurred_bg = cv2.GaussianBlur(background_gray, kernel, 0)
+    blurred_cur = cv2.GaussianBlur(current_gray, kernel, 0)
+   
+    # 2. Calculate difference with noise reduction
+    diff = cv2.absdiff(blurred_bg, blurred_cur)
+   
+    # 3. Apply fixed threshold to ignore minor changes
+    _, thresh = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+   
+    # 4. Count motion pixels
+    motion_pixels = cv2.countNonZero(thresh)
+    total_pixels = thresh.size
+    sensitivity = (motion_pixels / total_pixels) * 100 if total_pixels else 0.0
+    
+    # 5. Apply smoothing to prevent rapid changes
+    if hasattr(state, 'last_sensitivity_readings'):
+        state.last_sensitivity_readings.append(sensitivity)
+        if len(state.last_sensitivity_readings) > 5:
+            state.last_sensitivity_readings.pop(0)
+        # Use median of last 5 readings for stability
+        sensitivity = sorted(state.last_sensitivity_readings)[len(state.last_sensitivity_readings)//2]
+    else:
+        state.last_sensitivity_readings = [sensitivity]
+    
+    return sensitivity
+
+def check_material_match(text, materials=None):
+    """Check if text contains any material"""
+    if materials is None:
+        materials = state.materials
+   
+    if not text:
+        return None, 0
+   
+    text_lower = text.lower().strip()
+    for material in materials:
+        if material.lower() in text_lower:
+            return material, 100
+    return None, 0
+
+def rotate_image(img, angle):
+    """Rotate image by specified angle"""
+    if angle == 0:
+        return img
+    elif angle == 90:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    elif angle == 180:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    elif angle == 270:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    else:
+        (h, w) = img.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def create_save_task(text, roi_img, match_time, angle=0):
+    """Create image save task with rotation and text overlay"""
+    # Rotate the image to the matched angle
+    rotated_img = rotate_image(roi_img, angle)
+   
+    # Overlay matched text in top-right
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.2
+    thickness = 3
+    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+    x = rotated_img.shape[1] - text_size[0] - 20  # Right-aligned
+    y = 40  # Top margin
+   
+    # Add text with black border for readability
+    cv2.putText(rotated_img, text, (x, y), font, font_scale, (0, 0, 0), thickness+2, cv2.LINE_AA)
+    cv2.putText(rotated_img, text, (x, y), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
+   
+    # Generate filename
+    safe_text = "".join(c for c in text if c.isalnum() or c in (' ', '_', '-')).rstrip()
+    timestamp = match_time.strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{safe_text}_{timestamp}.png"
+    filepath = os.path.join(MATCHED_IMAGE_DIR, filename)
+   
+    return (rotated_img, filepath, filename, text, match_time)
+
+def log_match_to_txt(image_filename):
+    """Log match to text file"""
+    log_filename = exe_dir_path("matches_log.txt")
+    line = f"{image_filename}\n"
+    try:
+        with open(log_filename, 'a', encoding='utf-8') as f:
+            f.write(line)
+    except Exception as e:
+        print(f"Failed to write to {log_filename}: {e}")
+
+def easyocr_request(image, angle, reader):
+    """Process OCR request using EasyOCR and return results"""
+    try:
+        print(f"[DEBUG] Trying angle {angle}°...")
+       
+        # EasyOCR expects RGB format
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        else:
+            image_rgb = image
+       
+        # Run OCR
+        results = reader.readtext(image_rgb, detail=0, paragraph=False)
+       
+        words = []
+        for text in results:
+            if isinstance(text, str) and text.strip():
+                words.append(text.strip())
+       
+        print(f"[DEBUG] Complete angle {angle}° - {len(words)} words: {words}")
+        return words
+       
+    except Exception as e:
+        print(f"[ERROR] EasyOCR exception for angle {angle}: {e}")
+        return []
+
+
+def fps_monitor_thread():
+    """Background thread that measures camera FPS every 10 seconds"""
+    print("[INFO] FPS monitor thread started")
+    last_measurement_time = time.time()
+   
+    while not shutdown_event.is_set():
+        try:
+            current_time = time.time()
+           
+            # Measure FPS every 10 seconds
+            if current_time - last_measurement_time >= 10.0:
+                detected_fps = measure_camera_fps_from_timestamps()
+                
+                if detected_fps is not None:
+                    # Update global processing FPS to 80% of detected rate
+                    global CAMERA_FPS
+                    new_processing_fps = detected_fps * CAMERA_FPS_RATIO
+                    
+                    if abs(new_processing_fps - CAMERA_FPS) > 0.5:  # Only update if significant change
+                        CAMERA_FPS = new_processing_fps
+                        print(f"[INFO] Updated processing FPS to {CAMERA_FPS:.1f} (80% of {detected_fps:.1f})")
+                    else:
+                        print(f"[INFO] FPS stable at {detected_fps:.1f} (processing: {CAMERA_FPS:.1f})")
+                
+                last_measurement_time = current_time
+           
+            # Sleep most of the time to avoid CPU usage
+            time.sleep(1.0)
+           
+        except Exception as e:
+            print(f"[ERROR] FPS monitor exception: {e}")
+            time.sleep(5)
+
+def motion_monitor_thread():
+    """Lightweight background thread that monitors motion - faster updates during scanning"""
+    print("[INFO] Motion monitor thread started")
+    last_print_time = time.time()
+    last_sensitivity = None
+   
+    while not shutdown_event.is_set():
+        try:
+            current_time = time.time()
+           
+            # Adaptive monitoring: faster during scanning, slower when idle
+            scan_active = getattr(state, 'scanning_active', False)
+            update_interval = 0.5 if scan_active else 1.0  # 0.5s during scanning, 1s when idle
+           
+            # Check motion at adaptive interval using shared frame (no buffer consumption)
+            if current_time - last_print_time >= update_interval:
+                if state.background_gray is not None and state.raw_roi_img is not None:
+                    # Use the shared frame directly - no buffer consumption
+                    with lock:
+                        roi_img = state.raw_roi_img.copy() if state.raw_roi_img is not None else None
+                    
+                    if roi_img is not None:
+                        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+                        sensitivity = calculate_sensitivity(state.background_gray, gray)
+                       
+                        # Only print if sensitivity changed significantly or during scanning
+                        print_threshold = 0.05 if scan_active else 0.1  # More sensitive printing during scans
+                        if (last_sensitivity is None or 
+                            abs(sensitivity - last_sensitivity) >= print_threshold):
+                            status = "SCANNING" if scan_active else "IDLE"
+                            print(f"[SENS] Motion: {sensitivity:.1f}% ({status})")
+                            last_sensitivity = sensitivity
+                           
+                        # Update global current sensitivity for OCR thread
+                        state.current_sensitivity = sensitivity
+                       
+                last_print_time = current_time
+           
+            # Adaptive sleep: faster during scanning to catch motion drops quickly
+            sleep_time = 0.05 if scan_active else 0.1
+            time.sleep(sleep_time)
+           
+        except Exception as e:
+            print(f"[ERROR] Motion monitor exception: {e}")
+            time.sleep(1)
+
+def ocr_thread():
+    """Main OCR processing thread - simplified without motion monitoring"""
+    print("[INFO] OCR thread started")
+    scan_start_time = None
+    words_detected_this_round = False
+    last_unknown_save_time = time.time()
+    easyocr_reader = None  # EasyOCR reader - initialized when needed, cleaned up when idle
+   
+    while not shutdown_event.is_set():
+        try:
+            if state.raw_roi_img is None:
+                time.sleep(0.5)
+                continue
+
+            with lock:
+                roi_img = state.raw_roi_img.copy()
+
+            gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+
+            if state.background_gray is None:
+                state.background_gray = gray.copy()
+                print("[INFO] Background captured")
+                state.skip_frames = 5
+                continue
+           
+            # Skip frames during stabilization
+            if state.skip_frames > 0:
+                state.skip_frames -= 1
+                continue
+           
+            # Get current sensitivity from motion monitor thread
+            sensitivity = getattr(state, 'current_sensitivity', 0.0)
+           
+            if not state.scanning_active:
+                now = datetime.now()
+               
+                # Trigger scene change for any absolute change beyond threshold
+                if (state.last_match_sensitivity is not None and
+                    not state.scene_changed_flag and
+                    abs(sensitivity - state.last_match_sensitivity) >= SENSITIVITY_CHANGE_THRESHOLD):
+                    print(f"[DEBUG] Scene changed: {state.last_match_sensitivity:.1f}% → {sensitivity:.1f}%")
+                    state.scene_changed_flag = True
+               
+                # Check if cooldown period has ended
+                cooldown_ended = (state.last_match_time is None or
+                                 (now - state.last_match_time).total_seconds() >= MATCH_COOLDOWN_SECONDS)
+               
+                # Only start scanning if conditions are met AND sensitivity is stable
+                if (cooldown_ended and
+                    sensitivity >= MOTION_THRESHOLD_PERCENT and
+                    (state.last_match_sensitivity is None or state.scene_changed_flag)):
+                   
+                    state.scanning_active = True
+                    scan_start_time = datetime.now()
+                    words_detected_this_round = False
+                    print(f"[INFO] OCR enabled: sensitivity={sensitivity:.1f}%")
+                else:
+                    time.sleep(0.1)  # Sleep when idle
+                    continue
+           
+            # Use motion monitor's sensitivity value instead of checking fresh frame
+            if state.scanning_active:
+                current_sensitivity = getattr(state, 'current_sensitivity', 0.0)
+               
+                if current_sensitivity < MOTION_THRESHOLD_PERCENT:
+                    state.scanning_active = False
+                    print(f"[INFO] OCR disabled: sensitivity={current_sensitivity:.1f}%")
+                    # Clean up EasyOCR immediately when scanning stops (power-friendly)
+                    if easyocr_reader is not None:
+                        print("[INFO] Cleaning up EasyOCR (scanning inactive)")
+                        easyocr_reader = None
+                    continue
+           
+            # 12-second scan cycle
+            if state.scanning_active and scan_start_time:
+                elapsed = (datetime.now() - scan_start_time).total_seconds()
+                if elapsed >= TOTAL_SCAN_TIME:
+                    if not words_detected_this_round:
+                        print(f"[INFO] No words detected for {elapsed:.1f}s - resetting background")
+                        state.background_gray = None
+                        state.scanning_active = False
+                        state.last_match_sensitivity = None
+                        scan_start_time = None
+                       
+                        # Clean up EasyOCR when scan times out
+                        if easyocr_reader is not None:
+                            print("[INFO] Cleaning up EasyOCR (scan timeout)")
+                            easyocr_reader = None
+                    else:
+                        print(f"[INFO] Words detected during {elapsed:.1f}s scan - extending for another {TOTAL_SCAN_TIME}s round")
+                        scan_start_time = datetime.now()
+                        words_detected_this_round = False
+           
+            # Only proceed with OCR if scanning is active
+            if not state.scanning_active:
+                time.sleep(0.1)
+                continue
+               
+            # Check if OCR requests are already running - prevent overlapping scans
+            if state.ocr_requests_running:
+                print("[DEBUG] OCR requests still running, skipping scan")
+                time.sleep(0.1)
+                continue
+
+            print(f"[DEBUG] Starting OCR scan at {sensitivity:.1f}% sensitivity")
+            state.ocr_requests_running = True
+           
+            try:
+                # Initialize EasyOCR only when scanning starts (if not already loaded)
+                if easyocr_reader is None:
+                    print("[INFO] Initializing EasyOCR for scan...")
+                    easyocr_reader = initialize_easyocr()
+                else:
+                    print("[DEBUG] Using existing EasyOCR reader")
+               
+                angles = [0, 90, 180, 270]
+                results = []
+                broke_early = False
+                match_found = False
+                any_words_found = False
+               
+                # Sequential processing with immediate match checking after each angle
+                for i, angle in enumerate(angles):
+                    if i > 0:
+                        time.sleep(0.25)
+                   
+                    # Check sensitivity before processing each angle - get fresh reading from shared state
+                    current_sensitivity = getattr(state, 'current_sensitivity', 0.0)
+                    if current_sensitivity < MOTION_THRESHOLD_PERCENT:
+                        print(f"[DEBUG] Sensitivity dropped to {current_sensitivity:.1f}%, stopping scan at angle {angle}°")
+                        broke_early = True
+                        break
+                   
+                    # Grab latest image right before each request
+                    with lock:
+                        latest_roi_img = state.raw_roi_img.copy()
+                    rotated = rotate_image(latest_roi_img, angle)
+                   
+                    # Process this angle
+                    try:
+                        words = easyocr_request(rotated, angle, easyocr_reader)
+                        results.append((angle, words))
+                       
+                        # Check for matches immediately after this angle
+                        for word in words:
+                            material, score = check_material_match(word)
+                            if material and score >= MATCH_THRESHOLD:
+                                print(f"[MATCH] Found '{material}' at angle {angle}° - stopping scan")
+                                best_match = material
+                                best_angle = angle
+                                match_found = True
+                                any_words_found = True
+                               
+                                # Save matched image immediately
+                                save_task = create_save_task(best_match, roi_img, datetime.now(), best_angle)
+                                cv2.imwrite(save_task[1], save_task[0])
+                                log_match_to_txt(save_task[2])
+                                print(f"[SAVE] Saved {save_task[2]}")
+                               
+                                # Update state immediately after save
+                                state.scanning_active = False
+                                state.last_match_time = datetime.now()
+                                state.scene_changed_flag = False
+                                scan_start_time = None
+                               
+                                # Clean up EasyOCR when match found
+                                if easyocr_reader is not None:
+                                    print("[INFO] Cleaning up EasyOCR (match found)")
+                                    easyocr_reader = None
+                               
+                                # Update sensitivity baseline immediately after save
+                                current_sensitivity = calculate_sensitivity(state.background_gray, gray)
+                                state.last_match_sensitivity = current_sensitivity
+                                last_sensitivity = current_sensitivity  # Update cached value too
+                                print(f"[DEBUG] Updated match sensitivity baseline to: {current_sensitivity:.1f}%")
+                                print(f"[SUCCESS] Match found: {best_match} (Angle: {best_angle}°)")
+                                print(f"[INFO] OCR paused. Waiting for {MATCH_COOLDOWN_SECONDS}s cooldown AND scene change before resuming.")
+                               
+                                last_unknown_save_time = time.time()
+                                break
+                       
+                        # Break out of angle loop if match found
+                        if match_found:
+                            break
+                       
+                        if words:
+                            any_words_found = True
+                            print(f"[DEBUG] Angle {angle}° - No match")
+                           
+                    except Exception as e:
+                        print(f"[ERROR] Processing angle {angle}° failed: {e}")
+               
+                # Update based on results only if no match found
+                if not match_found:
+                    if any_words_found:
+                        words_detected_this_round = True
+                        print(f"[INFO] Words detected - continuing scanning")
+                    else:
+                        words_detected_this_round = False
+               
+                if not match_found and any_words_found:
+                    print(f"[INFO] Words detected but no match")
+                   
+                    # Save unknown image every 6 seconds
+                    current_time = time.time()
+                    time_since_last = current_time - last_unknown_save_time
+                   
+                    if time_since_last >= 6:
+                        print(f"[INFO] Saving unknown image")
+                        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        filename = f"unknown_{timestamp}.png"
+                        filepath = os.path.join(MATCHED_IMAGE_DIR, filename)
+                       
+                        if results:
+                            first_angle_img = rotate_image(roi_img, results[0][0])
+                            cv2.imwrite(filepath, first_angle_img)
+                            log_match_to_txt(filename)
+                            last_unknown_save_time = current_time
+                       
+            finally:
+                state.ocr_requests_running = False
+                print(f"[DEBUG] OCR requests completed, flag reset")
+               
+            # Reset timer on early exit
+            if broke_early:
+                last_unknown_save_time = time.time()
+               
+            # Reset timer when scanning is disabled
+            if not state.scanning_active and sensitivity < MOTION_THRESHOLD_PERCENT:
+                last_unknown_save_time = time.time()
+
+            # EasyOCR cleanup is now handled immediately when scanning stops
+
+        except Exception as e:
+            print(f"[ERROR] OCR thread exception: {e}")
+            traceback.print_exc()
+            time.sleep(1)
+
+def roi_display_thread(roi_buffer):
+    """Display ROI frames from buffer at original scale with FPS limiting - only consumer of buffer"""
+    # Create a window that maintains exact pixel size
+    cv2.namedWindow("Raw ROI", cv2.WINDOW_AUTOSIZE)
+   
+    # FPS limiting for display - use consistent timing
+    target_frame_time = 1.0 / CAMERA_FPS if CAMERA_FPS > 0 else 1.0/30
+    last_display_time = time.time()
+    last_buffer_empty_warning = 0
+    frames_processed = 0
+   
+    while not shutdown_event.is_set():
+        try:
+            # Conservative consumption - only take frame if buffer has multiple frames
+            latest_roi = None
+            frames_consumed = 0
+            
+            try:
+                buffer_size = roi_buffer.qsize()
+                
+                # Only consume if buffer has 3+ frames to prevent starvation
+                if buffer_size >= 3:
+                    latest_roi = roi_buffer.get_nowait()
+                    frames_consumed = 1
+                elif buffer_size == 0:
+                    # Buffer is empty - warn occasionally
+                    current_time = time.time()
+                    if current_time - last_buffer_empty_warning > 3:
+                        print(f"[WARN] Buffer empty - no frames available for display (processed {frames_processed} total)")
+                        last_buffer_empty_warning = current_time
+                    
+            except queue.Empty:
+                pass
+           
+            # If we got a frame, update state immediately
+            if latest_roi is not None:
+                with lock:
+                    state.raw_roi_img = latest_roi
+                    state.latest_frame = latest_roi
+                frames_processed += 1
+           
+            # Display at consistent FPS regardless of new frame availability
+            current_time = time.time()
+            if current_time - last_display_time >= target_frame_time:
+                if state.raw_roi_img is not None:
+                    # Show ROI at exact 1:1 pixel scale
+                    cv2.imshow("Raw ROI", state.raw_roi_img)
+               
+                last_display_time = current_time
+           
+            # Check for ESC key (this should be fast)
+            if cv2.waitKey(1) & 0xFF == 27:
+                shutdown_event.set()
+                break
+               
+            # Adaptive sleep based on buffer status
+            buffer_size = roi_buffer.qsize()
+            if buffer_size < 3:
+                time.sleep(0.01)  # Longer sleep when buffer is low to let it fill
+            else:
+                time.sleep(0.002)  # Shorter sleep when buffer has frames
+               
+        except Exception as e:
+            print(f"[ERROR] Display thread: {e}")
+    cv2.destroyAllWindows()
+
+def select_roi_interactively(cap):
+    """Allow user to select ROI interactively with screen-fitting display"""
+    print("[INFO] No ROI set. Please select ROI on the camera feed...")
+   
+    # Get screen dimensions
+    screen_width = 1920  # Default values if we can't get actual screen size
+    screen_height = 1080
+    try:
+        # Try to get actual screen resolution
+        import ctypes
+        user32 = ctypes.windll.user32
+        screen_width = user32.GetSystemMetrics(0)
+        screen_height = user32.GetSystemMetrics(1)
+    except:
+        pass
+   
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[ERROR] Failed to read frame for ROI selection")
+            time.sleep(0.1)
+            continue
+       
+        # Calculate scaling to fit frame to screen
+        h, w = frame.shape[:2]
+        scale_x = min(1.0, screen_width / w)
+        scale_y = min(1.0, screen_height / h)
+        scale = min(scale_x, scale_y)
+       
+        # Only resize if needed
+        if scale < 1.0:
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            display_frame = cv2.resize(frame, (new_w, new_h))
+        else:
+            display_frame = frame
+       
+        # Display instructions
+        instructions = "Draw ROI rectangle and press ENTER to confirm"
+        cv2.putText(display_frame, instructions, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 0, 255), 2)
+       
+        # Show resized frame for ROI selection
+        cv2.imshow("Select ROI (Press ENTER to confirm)", display_frame)
+        key = cv2.waitKey(1) & 0xFF
+       
+        # Let user select ROI on the resized frame
+        roi = cv2.selectROI("Select ROI (Press ENTER to confirm)", display_frame)
+        cv2.destroyWindow("Select ROI (Press ENTER to confirm)")
+       
+        if roi != (0, 0, 0, 0):  # User made a selection
+            x, y, w, h = roi
+           
+            # Scale ROI coordinates back to original frame size
+            if scale < 1.0:
+                x = int(x / scale)
+                y = int(y / scale)
+                w = int(w / scale)
+                h = int(h / scale)
+           
+            print(f"[INFO] ROI selected: x={x}, y={y}, width={w}, height={h}")
+            return (x, y, w, h)
+       
+        print("[WARN] Invalid ROI selection, trying again...")
+
+def update_roi_in_config(roi):
+    """Update ROI in materials.txt"""
+    config_file = exe_dir_path("materials.txt")
+    x, y, w, h = roi
+   
+    # Read existing config
+    lines = []
+    if os.path.exists(config_file):
+        with open(config_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+   
+    # Update or add ROI line
+    roi_line = f"ROI:{x},{y},{w},{h}\n"
+    roi_found = False
+    new_lines = []
+   
+    for line in lines:
+        if line.startswith("ROI:"):
+            new_lines.append(roi_line)
+            roi_found = True
+        else:
+            new_lines.append(line)
+   
+    if not roi_found:
+        new_lines.insert(0, roi_line)  # Add at beginning
+   
+    # Write updated config
+    with open(config_file, 'w', encoding='utf-8') as f:
+        f.writelines(new_lines)
+    print(f"[INFO] Updated ROI in materials.txt")
+
+def setup_camera_and_roi():
+    """Set up camera and ROI, prompting user if needed."""
+    cap = connect_camera()
+    if state.roi_box is None:
+        roi = select_roi_interactively(cap)
+        if roi:
+            state.roi_box = roi
+            update_roi_in_config(roi)
+            print(f"[DEBUG] Using new ROI: {state.roi_box}")
+    return cap
+
+def start_processing_threads(roi_buffer):
+    """Start motion monitor, FPS monitor, OCR and ROI display threads."""
+    threading.Thread(target=motion_monitor_thread, daemon=True).start()
+    threading.Thread(target=fps_monitor_thread, daemon=True).start()
+    threading.Thread(target=ocr_thread, daemon=True).start()
+    threading.Thread(target=roi_display_thread, args=(roi_buffer,), daemon=True).start()
+
+def main_loop(cap, roi_buffer):
+    """Main frame processing loop - capture as fast as possible, prevent buffer starvation."""
+    consecutive_failures = 0
+    last_successful_capture = time.time()
+    
+    while not shutdown_event.is_set():
+        try:
+            ret, frame = cap.read()
+            if not ret:
+                consecutive_failures += 1
+                print(f"[WARN] Frame read failed ({consecutive_failures}/3), reconnecting...")
+                
+                # Try to reconnect after 3 consecutive failures
+                if consecutive_failures >= 3:
+                    cap.release()
+                    try:
+                        cap = connect_camera()
+                        consecutive_failures = 0
+                        print("[INFO] Camera reconnected successfully")
+                    except Exception as e:
+                        print(f"[ERROR] Camera reconnection failed: {e}")
+                        time.sleep(1)
+                continue
+            
+            # Reset failure counter on successful read
+            consecutive_failures = 0
+            last_successful_capture = time.time()
+            
+            # Record timestamp for FPS measurement (actual camera capture rate)
+            with lock:
+                current_time = time.time()
+                state.frame_timestamps.append(current_time)
+                
+                # Keep only last 60 seconds of timestamps for efficiency
+                state.frame_timestamps = [t for t in state.frame_timestamps if current_time - t <= 60.0]
+            
+            if state.roi_box is None:
+                continue
+                
+            x, y, w, h = state.roi_box
+            roi = frame[y:y+h, x:x+w]
+            if roi.size == 0:
+                continue
+                
+            try:
+                # Only add frame if there's room in buffer, otherwise throw it out
+                roi_buffer.put_nowait(roi.copy())
+                
+            except queue.Full:
+                # Buffer is full (15 frames), throw out this frame - natural overflow behavior
+                pass
+                
+        except Exception as e:
+            print(f"[ERROR] Main loop: {e}")
+            consecutive_failures += 1
+            time.sleep(0.1)
+            
+        # Check for prolonged capture failure
+        if time.time() - last_successful_capture > 5:
+            print("[ERROR] No successful captures for 5 seconds, attempting camera reset")
+            cap.release()
+            try:
+                cap = connect_camera()
+                last_successful_capture = time.time()
+                consecutive_failures = 0
+            except Exception as e:
+                print(f"[ERROR] Camera reset failed: {e}")
+                time.sleep(2)
+                
+    cap.release()
+    cv2.destroyAllWindows()
+
+def main():
+    """Main application"""
+    try:
+        load_config()
+        os.makedirs(MATCHED_IMAGE_DIR, exist_ok=True)
+        cap = setup_camera_and_roi()
+        ret, frame = cap.read()
+        if not ret:
+            print("[ERROR] Cannot read initial frame")
+            return
+        print(f"[DEBUG] Using ROI: {state.roi_box}")
+        roi_buffer = queue.Queue(maxsize=15)  # The one buffer everything pulls from
+        start_processing_threads(roi_buffer)
+        print("[INFO] Application started")
+        print(f"[INFO] Processing ROI at {CAMERA_FPS:.1f} FPS (adaptive)")
+        main_loop(cap, roi_buffer)
+    except Exception as e:
+        print(f"[FATAL] Application error: {e}")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
